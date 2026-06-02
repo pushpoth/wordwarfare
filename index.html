@@ -1,0 +1,637 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Target, Zap, Anchor, Crosshair, AlertCircle, Play, RefreshCcw, ShieldAlert, Navigation } from 'lucide-react';
+
+// --- Configuration & Constants ---
+const MAX_BATTERY = 5;
+const BATTERY_REGEN_MS = 15000; // 15 seconds for gameplay pacing (instead of 60s for playability)
+const START_TORPEDOES = 50;
+const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+const LEVELS = [
+  { level: 1, size: 10, units: 4 },
+  { level: 2, size: 12, units: 5 },
+  { level: 3, size: 15, units: 6 },
+  { level: 4, size: 18, units: 7 },
+  { level: 5, size: 20, units: 8 },
+  { level: 6, size: 22, units: 8 },
+  { level: 7, size: 25, units: 9 },
+  { level: 8, size: 27, units: 9 },
+  { level: 9, size: 28, units: 10 },
+  { level: 10, size: 30, units: 10 },
+];
+
+const DICTIONARY = [
+  "SUBMARINE", "TORPEDO", "VESSEL", "OCEAN", "RADAR", "SONAR", "CAPTAIN", "FLEET", "BATTLE", "DEPTH",
+  "WATER", "MISSILE", "CRUISER", "FRIGATE", "WARSHIP", "TARGET", "SIGNAL", "TRENCH", "MARINE", "SAILOR",
+  "COMPASS", "BEACON", "NAUTICAL", "ABYSS", "BALLAST", "HULL", "DIVE", "PERISCOPE", "SILENT", "HUNTER",
+  "ENGINE", "PROPELLER", "RUDDER", "KNOTS", "CURRENT", "VOYAGE", "TACTIC", "STRIKE", "LAUNCH", "DANGER",
+  "ALARM", "PRESSURE", "SURFACE", "PATROL", "CONVOY", "ESCORT", "SEAMAN", "NAVY", "ADMIRAL", "BRIDGE",
+  "DECK", "HATCH", "CABIN", "GALLEY", "ANCHOR", "KRAKEN", "NEPTUNE", "TRIDENT", "PELAGIC", "BENTHIC",
+  "SALTWATER", "COAST", "SHORE", "HARBOR", "PORT", "DOCK", "PIER", "WHARF", "BUOY", "REEF", "SHOAL",
+  "TIDE", "WAVE", "SURF", "SWELL", "FOAM", "CREST", "TROUGH", "WAKE", "RIPPLE", "SPRAY", "SPLASH"
+];
+
+// --- Engine & Helpers ---
+const randomInt = (max) => Math.floor(Math.random() * max);
+const getDistance = (r1, c1, r2, c2) => Math.sqrt(Math.pow(r1 - r2, 2) + Math.pow(c1 - c2, 2));
+
+const generateGrid = (config) => {
+  const { size, units: unitCount } = config;
+  const grid = Array(size).fill(null).map((_, r) => 
+    Array(size).fill(null).map((_, c) => ({
+      r, c,
+      letter: ALPHABET[randomInt(26)],
+      revealed: false,
+      unitId: null,
+      isSubmarine: false
+    }))
+  );
+
+  const subR = Math.floor(size / 2);
+  const subC = Math.floor(size / 2);
+  grid[subR][subC].isSubmarine = true;
+  grid[subR][subC].revealed = true; // Sub is always visible
+
+  let availableWords = [...DICTIONARY].sort(() => 0.5 - Math.random());
+  const placedUnits = [];
+
+  for (let i = 0; i < unitCount && availableWords.length > 0; i++) {
+    const word = availableWords.pop();
+    let placed = false;
+    let attempts = 0;
+
+    while (!placed && attempts < 150) {
+      attempts++;
+      const orientation = size >= 15 ? randomInt(3) : randomInt(2); // 0:H, 1:V, 2:D
+      let r = randomInt(size);
+      let c = randomInt(size);
+
+      // Check boundaries
+      if (orientation === 0 && c + word.length > size) continue;
+      if (orientation === 1 && r + word.length > size) continue;
+      if (orientation === 2 && (r + word.length > size || c + word.length > size)) continue;
+
+      // Check collisions
+      let valid = true;
+      for (let j = 0; j < word.length; j++) {
+        const checkR = r + (orientation === 1 || orientation === 2 ? j : 0);
+        const checkC = c + (orientation === 0 || orientation === 2 ? j : 0);
+        
+        if (grid[checkR][checkC].unitId !== null || grid[checkR][checkC].isSubmarine) {
+          valid = false;
+          break;
+        }
+      }
+
+      if (valid) {
+        const unitId = `unit-${i}`;
+        const tiles = [];
+        for (let j = 0; j < word.length; j++) {
+          const placeR = r + (orientation === 1 || orientation === 2 ? j : 0);
+          const placeC = c + (orientation === 0 || orientation === 2 ? j : 0);
+          grid[placeR][placeC].letter = word[j];
+          grid[placeR][placeC].unitId = unitId;
+          tiles.push({ r: placeR, c: placeC, letter: word[j] });
+        }
+
+        placedUnits.push({
+          id: unitId,
+          word,
+          tiles,
+          revealedLetters: new Set(),
+          destroyed: false,
+          misses: 0
+        });
+        placed = true;
+      }
+    }
+  }
+
+  return { grid, units: placedUnits, subPos: { r: subR, c: subC } };
+};
+
+// --- Main Component ---
+export default function App() {
+  // Global State
+  const [gameState, setGameState] = useState('menu'); // menu, playing, won, lost
+  const [currentLevelIndex, setCurrentLevelIndex] = useState(0);
+  const [totalScore, setTotalScore] = useState(0);
+
+  // Mission State
+  const [grid, setGrid] = useState([]);
+  const [units, setUnits] = useState([]);
+  const [subPos, setSubPos] = useState({ r: 0, c: 0 });
+  const [battery, setBattery] = useState(MAX_BATTERY);
+  const [regenProgress, setRegenProgress] = useState(100);
+  const [torpedoes, setTorpedoes] = useState(START_TORPEDOES);
+  const [mode, setMode] = useState('RADAR'); // RADAR, TORPEDO
+  const [discoveredQueue, setDiscoveredQueue] = useState([]);
+  const [activeUnitId, setActiveUnitId] = useState(null);
+  const [missionScore, setMissionScore] = useState(0);
+  
+  // Track inputs for visual feedback
+  const [radarPings, setRadarPings] = useState(new Set()); 
+  const [torpedoGuesses, setTorpedoGuesses] = useState({}); // { [unitId]: { hits: Set, misses: Set } }
+
+  // --- Initialization ---
+  const startMission = useCallback((levelIdx) => {
+    const config = LEVELS[levelIdx];
+    const { grid: newGrid, units: newUnits, subPos: newSub } = generateGrid(config);
+    
+    setGrid(newGrid);
+    setUnits(newUnits);
+    setSubPos(newSub);
+    setBattery(MAX_BATTERY);
+    setRegenProgress(100);
+    setTorpedoes(START_TORPEDOES);
+    setMode('RADAR');
+    setDiscoveredQueue([]);
+    setActiveUnitId(null);
+    setMissionScore(0);
+    setRadarPings(new Set());
+    setTorpedoGuesses({});
+    setCurrentLevelIndex(levelIdx);
+    setGameState('playing');
+  }, []);
+
+  // --- Battery Regeneration Timer ---
+  useEffect(() => {
+    if (gameState !== 'playing') return;
+
+    const interval = setInterval(() => {
+      setBattery((prev) => {
+        if (prev >= MAX_BATTERY) {
+          setRegenProgress(100);
+          return prev;
+        }
+        return prev;
+      });
+
+      setRegenProgress((prev) => {
+        if (battery >= MAX_BATTERY) return 100;
+        const newProg = prev + (100 / (BATTERY_REGEN_MS / 100));
+        if (newProg >= 100) {
+          setBattery(b => Math.min(b + 1, MAX_BATTERY));
+          return 0;
+        }
+        return newProg;
+      });
+    }, 100);
+
+    return () => clearInterval(interval);
+  }, [gameState, battery]);
+
+  // --- Gameplay Mechanics ---
+  const handleKeyInput = useCallback((key) => {
+    if (gameState !== 'playing') return;
+    const upperKey = key.toUpperCase();
+    if (!ALPHABET.includes(upperKey)) return;
+
+    if (mode === 'RADAR') {
+      executeRadarPing(upperKey);
+    } else if (mode === 'TORPEDO') {
+      executeTorpedoFire(upperKey);
+    }
+  }, [gameState, mode, battery, torpedoes, grid, units, activeUnitId, discoveredQueue]);
+
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.ctrlKey || e.altKey || e.metaKey) return;
+      handleKeyInput(e.key);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleKeyInput]);
+
+  const executeRadarPing = (letter) => {
+    if (battery < 1) return;
+    
+    setBattery(prev => prev - 1);
+    if (battery === MAX_BATTERY) setRegenProgress(0); // Jumpstart regen visually
+
+    setRadarPings(prev => new Set([...prev, letter]));
+
+    const size = grid.length;
+    // Find matching unrevealed tiles
+    const matches = [];
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        if (grid[r][c].letter === letter && !grid[r][c].revealed) {
+          matches.push({ r, c });
+        }
+      }
+    }
+
+    if (matches.length === 0) return;
+
+    // Reveal 4 to 10 random matches (scaled slightly by board size)
+    const revealCount = Math.min(matches.length, Math.floor(Math.random() * 7) + 4);
+    const shuffled = matches.sort(() => 0.5 - Math.random());
+    const toReveal = shuffled.slice(0, revealCount);
+
+    const newGrid = [...grid];
+    const newDiscovered = new Set(discoveredQueue);
+    let hitUnit = false;
+
+    toReveal.forEach(({ r, c }) => {
+      newGrid[r][c] = { ...newGrid[r][c], revealed: true };
+      if (newGrid[r][c].unitId) {
+        newDiscovered.add(newGrid[r][c].unitId);
+        hitUnit = true;
+      }
+    });
+
+    setGrid(newGrid);
+
+    if (hitUnit) {
+      const queueArray = Array.from(newDiscovered);
+      // Sort by distance to submarine
+      queueArray.sort((aId, bId) => {
+        const uA = units.find(u => u.id === aId);
+        const uB = units.find(u => u.id === bId);
+        const distA = getDistance(uA.tiles[0].r, uA.tiles[0].c, subPos.r, subPos.c);
+        const distB = getDistance(uB.tiles[0].r, uB.tiles[0].c, subPos.r, subPos.c);
+        return distA - distB;
+      });
+
+      setDiscoveredQueue(queueArray);
+      
+      // Auto-switch to torpedo mode if we weren't already engaged
+      if (!activeUnitId || units.find(u => u.id === activeUnitId)?.destroyed) {
+        setActiveUnitId(queueArray[0]);
+        setMode('TORPEDO');
+      }
+    }
+  };
+
+  const executeTorpedoFire = (letter) => {
+    if (torpedoes <= 0) return;
+    if (!activeUnitId) return;
+
+    const unitGuesses = torpedoGuesses[activeUnitId] || { hits: new Set(), misses: new Set() };
+    if (unitGuesses.hits.has(letter) || unitGuesses.misses.has(letter)) return; // Already guessed
+
+    setTorpedoes(prev => prev - 1);
+    
+    const activeUnitIndex = units.findIndex(u => u.id === activeUnitId);
+    const unit = units[activeUnitIndex];
+    const isHit = unit.word.includes(letter);
+    
+    const newGuesses = {
+      hits: new Set(unitGuesses.hits),
+      misses: new Set(unitGuesses.misses)
+    };
+
+    if (isHit) {
+      newGuesses.hits.add(letter);
+      setMissionScore(s => s + 10); // Point per hit letter
+
+      // Reveal tiles on grid
+      const newGrid = [...grid];
+      const newUnits = [...units];
+      const newRevealedLetters = new Set(unit.revealedLetters).add(letter);
+      
+      unit.tiles.forEach(({ r, c, letter: tLetter }) => {
+        if (tLetter === letter) {
+          newGrid[r][c] = { ...newGrid[r][c], revealed: true };
+        }
+      });
+
+      // Check if destroyed
+      const isDestroyed = Array.from(unit.word).every(char => newRevealedLetters.has(char));
+      
+      newUnits[activeUnitIndex] = { 
+        ...unit, 
+        revealedLetters: newRevealedLetters,
+        destroyed: isDestroyed
+      };
+
+      setGrid(newGrid);
+      setUnits(newUnits);
+
+      if (isDestroyed) {
+        let earned = unit.word.length * 10;
+        if (unit.misses === 0) earned += 50; // Perfect kill
+        setMissionScore(s => s + earned);
+
+        const newQueue = discoveredQueue.filter(id => id !== activeUnitId);
+        setDiscoveredQueue(newQueue);
+
+        // Check Win Condition
+        if (newUnits.every(u => u.destroyed)) {
+          setTimeout(() => {
+            setTotalScore(prev => prev + missionScore + earned);
+            setGameState('won');
+          }, 1000);
+          return;
+        }
+
+        // Auto target next or return to radar
+        if (newQueue.length > 0) {
+          setActiveUnitId(newQueue[0]);
+        } else {
+          setActiveUnitId(null);
+          setMode('RADAR');
+        }
+      }
+
+    } else {
+      newGuesses.misses.add(letter);
+      const newUnits = [...units];
+      newUnits[activeUnitIndex] = { ...unit, misses: unit.misses + 1 };
+      setUnits(newUnits);
+    }
+
+    setTorpedoGuesses({ ...torpedoGuesses, [activeUnitId]: newGuesses });
+
+    // Check Lose Condition
+    if (torpedoes - 1 === 0 && !units.every(u => u.destroyed)) {
+      setTimeout(() => setGameState('lost'), 1000);
+    }
+  };
+
+  const switchTarget = () => {
+    if (discoveredQueue.length <= 1) return;
+    const currentIndex = discoveredQueue.indexOf(activeUnitId);
+    const nextIndex = (currentIndex + 1) % discoveredQueue.length;
+    setActiveUnitId(discoveredQueue[nextIndex]);
+  };
+
+  // --- Rendering Helpers ---
+  const activeUnit = units.find(u => u.id === activeUnitId);
+  const config = LEVELS[currentLevelIndex];
+
+  const getTileClass = (r, c, tile) => {
+    let base = "w-7 h-7 sm:w-8 sm:h-8 flex items-center justify-center text-xs sm:text-sm font-bold rounded-sm transition-all duration-300 select-none ";
+    
+    if (tile.isSubmarine) {
+      return base + "bg-blue-600 text-white z-10 shadow-lg shadow-blue-500/50";
+    }
+
+    if (!tile.revealed) {
+      return base + "bg-slate-800 border border-slate-700 text-transparent shadow-inner";
+    }
+
+    if (!tile.unitId) {
+      return base + "bg-slate-700 border border-slate-600 text-slate-400 opacity-60";
+    }
+
+    // It belongs to a unit
+    const unit = units.find(u => u.id === tile.unitId);
+    if (unit.destroyed) {
+      return base + "bg-red-950 border border-red-900 text-red-500 opacity-50";
+    }
+
+    if (tile.unitId === activeUnitId) {
+      return base + "bg-red-600 border border-red-500 text-white animate-pulse shadow-[0_0_10px_rgba(220,38,38,0.7)]";
+    }
+
+    // Revealed but belongs to a non-active queued unit
+    return base + "bg-amber-600 border border-amber-500 text-white";
+  };
+
+  // --- Screens ---
+  if (gameState === 'menu') {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col items-center justify-center p-6 font-mono">
+        <div className="max-w-md w-full text-center space-y-8">
+          <Anchor className="w-24 h-24 text-blue-500 mx-auto mb-4" />
+          <h1 className="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-emerald-400 tracking-tight">
+            SUBMARINE<br/>WORD WARFARE
+          </h1>
+          <p className="text-slate-400 text-sm">
+            Scan the grid, decode enemy signals, and destroy their vocabulary fleet before running out of torpedoes.
+          </p>
+          
+          <div className="space-y-4 pt-8">
+            <button 
+              onClick={() => startMission(0)}
+              className="w-full py-4 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg transition-colors flex items-center justify-center gap-2 uppercase tracking-widest"
+            >
+              <Play className="w-5 h-5" />
+              Start Campaign
+            </button>
+          </div>
+          
+          <div className="text-xs text-slate-500 space-y-2 text-left bg-slate-900 p-4 rounded-lg border border-slate-800">
+            <p><strong>RADAR:</strong> Spend battery to ping letters & reveal ocean tiles.</p>
+            <p><strong>TORPEDO:</strong> Spend ammo to guess letters of discovered enemy units.</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (gameState === 'won' || gameState === 'lost') {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col items-center justify-center p-6 font-mono">
+        <div className="max-w-md w-full text-center space-y-6 bg-slate-900 p-8 rounded-xl border border-slate-800 shadow-2xl">
+          {gameState === 'won' ? (
+            <>
+              <ShieldAlert className="w-20 h-20 text-emerald-500 mx-auto mb-4" />
+              <h2 className="text-3xl font-bold text-emerald-400">MISSION SECURED</h2>
+              <p className="text-slate-400">Enemy fleet destroyed. Sector clear.</p>
+            </>
+          ) : (
+            <>
+              <AlertCircle className="w-20 h-20 text-red-500 mx-auto mb-4" />
+              <h2 className="text-3xl font-bold text-red-500">MISSION FAILED</h2>
+              <p className="text-slate-400">Out of torpedoes. We are retreating.</p>
+            </>
+          )}
+
+          <div className="py-6 border-y border-slate-800">
+            <div className="flex justify-between mb-2">
+              <span className="text-slate-400">Mission Score:</span>
+              <span className="font-bold">{missionScore}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-slate-400">Total Score:</span>
+              <span className="font-bold text-blue-400">{totalScore + missionScore}</span>
+            </div>
+          </div>
+
+          <div className="pt-4 flex gap-4">
+            {gameState === 'won' && currentLevelIndex < LEVELS.length - 1 && (
+              <button 
+                onClick={() => startMission(currentLevelIndex + 1)}
+                className="flex-1 py-3 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg transition-colors flex items-center justify-center gap-2"
+              >
+                Next Sector <Navigation className="w-4 h-4" />
+              </button>
+            )}
+            <button 
+              onClick={() => startMission(currentLevelIndex)}
+              className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-white font-bold rounded-lg transition-colors flex items-center justify-center gap-2"
+            >
+              <RefreshCcw className="w-4 h-4" /> Retry
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // --- Playing UI ---
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-200 flex flex-col font-mono select-none overflow-hidden">
+      
+      {/* Top Bar (Stats) */}
+      <header className="bg-slate-900 border-b border-slate-800 p-3 sm:p-4 flex flex-wrap items-center justify-between gap-4 z-20 shadow-lg">
+        <div className="flex items-center gap-4">
+          <div className="flex flex-col">
+            <span className="text-xs text-slate-500 uppercase font-bold tracking-wider">Sector</span>
+            <span className="text-lg font-bold text-blue-400">{config.level}</span>
+          </div>
+          <div className="w-px h-8 bg-slate-700"></div>
+          <div className="flex flex-col">
+            <span className="text-xs text-slate-500 uppercase font-bold tracking-wider">Score</span>
+            <span className="text-lg font-bold text-emerald-400">{totalScore + missionScore}</span>
+          </div>
+        </div>
+
+        <div className="flex flex-1 max-w-sm justify-end gap-6 sm:gap-8">
+          {/* Battery */}
+          <div className="flex flex-col items-end w-24 sm:w-32">
+            <div className="flex items-center gap-1.5 text-xs text-slate-400 uppercase font-bold mb-1">
+              <Zap className={`w-4 h-4 ${battery > 0 ? 'text-yellow-400' : 'text-slate-600'}`} />
+              Battery ({battery}/{MAX_BATTERY})
+            </div>
+            <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden flex">
+              {[...Array(MAX_BATTERY)].map((_, i) => (
+                <div key={i} className={`flex-1 border-r border-slate-900 last:border-0 ${i < battery ? 'bg-yellow-400' : 'bg-transparent'}`} />
+              ))}
+            </div>
+            <div className="w-full h-0.5 bg-slate-800 mt-1">
+              <div className="h-full bg-blue-500 transition-all duration-100 ease-linear" style={{ width: `${regenProgress}%` }} />
+            </div>
+          </div>
+
+          {/* Torpedoes */}
+          <div className="flex flex-col items-end">
+            <div className="flex items-center gap-1.5 text-xs text-slate-400 uppercase font-bold mb-1">
+              <Crosshair className={`w-4 h-4 ${torpedoes > 10 ? 'text-red-400' : 'text-red-600 animate-pulse'}`} />
+              Torpedoes
+            </div>
+            <span className="text-xl font-black leading-none">{torpedoes}</span>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Play Area */}
+      <div className="flex-1 overflow-auto relative bg-slate-950 p-4 flex items-center justify-center custom-scrollbar">
+        {/* Grid Container */}
+        <div 
+          className="grid gap-1 border-4 border-slate-800 p-2 bg-slate-900 rounded-lg shadow-2xl relative"
+          style={{ gridTemplateColumns: `repeat(${config.size}, minmax(0, 1fr))` }}
+        >
+          {grid.map((row, r) => row.map((tile, c) => (
+            <div key={`${r}-${c}`} className={getTileClass(r, c, tile)}>
+              {tile.isSubmarine ? <Anchor className="w-4 h-4" /> : (tile.revealed ? tile.letter : '')}
+            </div>
+          )))}
+        </div>
+      </div>
+
+      {/* Control Panel (Bottom) */}
+      <div className="bg-slate-900 border-t border-slate-800 p-4 z-20 flex flex-col gap-4 shadow-[0_-10px_30px_rgba(0,0,0,0.5)]">
+        
+        {/* Mode & Target Info */}
+        <div className="flex flex-col sm:flex-row items-center justify-between gap-4 max-w-4xl mx-auto w-full">
+          
+          {/* Mode Switcher */}
+          <div className="flex bg-slate-950 rounded-lg p-1 border border-slate-800 w-full sm:w-auto">
+            <button
+              onClick={() => { if (activeUnitId) setMode('RADAR'); }}
+              disabled={!activeUnitId}
+              className={`flex-1 sm:flex-none px-6 py-2 rounded-md text-sm font-bold tracking-wider transition-colors flex items-center justify-center gap-2 ${mode === 'RADAR' ? 'bg-blue-600 text-white' : 'text-slate-500 hover:text-slate-300'} ${!activeUnitId && 'opacity-50 cursor-not-allowed'}`}
+            >
+              <Target className="w-4 h-4" /> RADAR
+            </button>
+            <button
+              onClick={() => { if (activeUnitId) setMode('TORPEDO'); }}
+              disabled={!activeUnitId}
+              className={`flex-1 sm:flex-none px-6 py-2 rounded-md text-sm font-bold tracking-wider transition-colors flex items-center justify-center gap-2 ${mode === 'TORPEDO' ? 'bg-red-600 text-white' : 'text-slate-500 hover:text-slate-300'} ${!activeUnitId && 'opacity-50 cursor-not-allowed'}`}
+            >
+              <Crosshair className="w-4 h-4" /> TORPEDO
+            </button>
+          </div>
+
+          {/* Active Target Display */}
+          {mode === 'TORPEDO' && activeUnit && (
+            <div className="flex-1 flex flex-col items-center sm:items-end">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-xs text-red-400 font-bold uppercase tracking-widest flex items-center gap-1">
+                  <Target className="w-3 h-3" /> Target Locked
+                </span>
+                {discoveredQueue.length > 1 && (
+                  <button onClick={switchTarget} className="text-xs bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded text-slate-300 transition-colors">
+                    Switch Target
+                  </button>
+                )}
+              </div>
+              <div className="flex gap-1.5 bg-slate-950 p-2 rounded border border-slate-800">
+                {Array.from(activeUnit.word).map((char, i) => (
+                  <div key={i} className={`w-8 h-10 border-b-2 flex items-center justify-center text-lg font-bold ${activeUnit.revealedLetters.has(char) ? 'border-emerald-500 text-emerald-400' : 'border-slate-700 text-transparent'}`}>
+                    {activeUnit.revealedLetters.has(char) ? char : '_'}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {mode === 'RADAR' && (
+             <div className="flex-1 text-center sm:text-right text-slate-400 text-sm">
+               Scan the grid to locate enemy vocabulary signatures.
+             </div>
+          )}
+        </div>
+
+        {/* Keyboard */}
+        <div className="w-full max-w-3xl mx-auto flex flex-col gap-2">
+          {['QWERTYUIOP', 'ASDFGHJKL', 'ZXCVBNM'].map((row, rIdx) => (
+            <div key={rIdx} className="flex justify-center gap-1 sm:gap-2">
+              {Array.from(row).map(key => {
+                let status = 'neutral';
+                
+                if (mode === 'RADAR') {
+                  if (radarPings.has(key)) status = 'radar-used';
+                } else if (mode === 'TORPEDO' && activeUnitId) {
+                  const guesses = torpedoGuesses[activeUnitId];
+                  if (guesses?.hits.has(key)) status = 'torpedo-hit';
+                  else if (guesses?.misses.has(key)) status = 'torpedo-miss';
+                }
+
+                const baseStyle = "h-12 min-w-[2.5rem] sm:min-w-[3rem] sm:w-12 px-2 rounded-md text-sm sm:text-base font-bold transition-colors active:scale-95 shadow-sm uppercase flex items-center justify-center border-b-4 ";
+                const styles = {
+                  'neutral': "bg-slate-700 text-slate-200 border-slate-800 hover:bg-slate-600",
+                  'radar-used': "bg-slate-800 text-slate-500 border-slate-900 opacity-80",
+                  'torpedo-hit': "bg-emerald-600 text-white border-emerald-800",
+                  'torpedo-miss': "bg-slate-800 text-slate-600 border-slate-900 opacity-50",
+                };
+
+                return (
+                  <button
+                    key={key}
+                    onClick={() => handleKeyInput(key)}
+                    className={baseStyle + styles[status]}
+                  >
+                    {key}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+
+      </div>
+
+      <style dangerouslySetInnerHTML={{__html: `
+        .custom-scrollbar::-webkit-scrollbar { width: 8px; height: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #020617; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #334155; }
+      `}} />
+    </div>
+  );
+}
